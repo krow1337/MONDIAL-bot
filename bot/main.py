@@ -1,3 +1,4 @@
+# ========== ИМПОРТЫ ==========
 import asyncio
 import logging
 import sqlite3
@@ -8,14 +9,26 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiocryptopay import AioCryptoPay as CryptoPay
 
 # ========== НАСТРОЙКИ ==========
 BOT_TOKEN = "8666560798:AAERpn353BmLAucNeSLI7d4cnxBB3hdHb3M"
 WALLET_ADDRESS = "UQAGonDQgytakpGpKuoT8E00yXQN7mugl2cKJzKb_0HjqXIF"
+CRYPTO_TOKEN = "552832:AAPr6hpSVHxlz0oxqrlGvhgKTDivpzZjNa4"
 
+# ========== СОЗДАЁМ BOT И DP ==========
 bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
+
+# ========== СОЗДАЁМ CRYPTO BOT ==========
+try:
+    loop = asyncio.get_running_loop()
+except RuntimeError:
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+cp = CryptoPay(token=CRYPTO_TOKEN)
 
 # ========== БАЗА ДАННЫХ ==========
 db_path = "../database"
@@ -23,6 +36,8 @@ if not os.path.exists(db_path):
     os.makedirs(db_path)
 conn = sqlite3.connect(os.path.join(db_path, "mondial.db"))
 cursor = conn.cursor()
+
+# ... (остальной код с таблицами, состояниями и функциями)
 
 # Создаём таблицы
 cursor.execute("""
@@ -46,6 +61,7 @@ CREATE TABLE IF NOT EXISTS deals (
     quantity TEXT,
     amount REAL,
     status TEXT DEFAULT 'waiting',
+    crypto_invoice_id TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
 """)
@@ -345,7 +361,7 @@ async def process_buyer_id(message: types.Message, state: FSMContext):
 async def accept_deal(callback: types.CallbackQuery):
     deal_id = int(callback.data.split("_")[1])
     
-    cursor.execute("SELECT seller_id, amount FROM deals WHERE deal_id = ?", (deal_id,))
+    cursor.execute("SELECT seller_id, item, amount FROM deals WHERE deal_id = ?", (deal_id,))
     deal = cursor.fetchone()
     
     cursor.execute("UPDATE deals SET status = 'active' WHERE deal_id = ?", (deal_id,))
@@ -353,23 +369,41 @@ async def accept_deal(callback: types.CallbackQuery):
     
     await callback.message.edit_text("✅ Сделка подтверждена!")
     
-    payment_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💰 Я оплатил", callback_data=f"paid_{deal_id}")],
-        [InlineKeyboardButton(text="❌ Отменить сделку", callback_data=f"cancel_{deal_id}")]
-    ])
-    
-    await callback.message.answer(
-        f"💳 Оплатите {deal[1]:,.0f} ₽ на кошелёк гаранта:\n\n"
-        f"🔗 `{WALLET_ADDRESS}`\n\n"
-        f"⚠️ *🔥 ВАЖНО! 🔥*\n"
-        f"Перевод должен быть выполнен ТОЛЬКО в сети *TON*!\n"
-        f"❌ Если вы отправите в другой сети (BSC, ERC20, TRC20) — "
-        f"средства будут УТЕРЯНЫ безвозвратно.\n\n"
-        f"✅ Убедитесь, что в кошельке выбрана сеть *TON* перед отправкой.\n\n"
-        f"📌 После оплаты нажмите кнопку ниже:",
-        reply_markup=payment_keyboard,
-        parse_mode="Markdown"
-    )
+    try:
+        # Создаём счёт в Crypto Bot
+        invoice = await cp.create_invoice(
+            amount=deal[2],
+            asset="USDT",
+            description=f"Оплата сделки #{deal_id}",
+            payload=str(deal_id)
+        )
+        
+        # Сохраняем ID счёта в базу
+        cursor.execute("UPDATE deals SET crypto_invoice_id = ? WHERE deal_id = ?", 
+                      (invoice.invoice_id, deal_id))
+        conn.commit()
+        
+        # Кнопки для оплаты
+        payment_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Оплатить через Crypto Bot", url=invoice.pay_url)],
+            [InlineKeyboardButton(text="✅ Я оплатил", callback_data=f"check_payment_{deal_id}")],
+            [InlineKeyboardButton(text="❌ Отменить сделку", callback_data=f"cancel_{deal_id}")]
+        ])
+        
+        await callback.message.answer(
+            f"💳 *Оплата сделки #{deal_id}*\n\n"
+            f"💰 Сумма: *{deal[2]} USDT*\n"
+            f"📦 Товар: {deal[1]}\n\n"
+            f"🔗 Нажмите кнопку ниже, чтобы оплатить через Crypto Bot:\n\n"
+            f"⚠️ *ВАЖНО!*\n"
+            f"• Оплата принимается в *USDT* (сеть TON)\n"
+            f"• После оплаты нажмите кнопку «✅ Я оплатил»",
+            reply_markup=payment_keyboard,
+            parse_mode="Markdown"
+        )
+        
+    except Exception as e:
+        await callback.message.answer(f"❌ Ошибка создания счёта: {str(e)}")
     
     # Получаем статистику покупателя
     cursor.execute("""
@@ -391,6 +425,43 @@ async def accept_deal(callback: types.CallbackQuery):
         parse_mode="Markdown"
     )
 
+# ========== ПРОВЕРКА ОПЛАТЫ ==========
+@dp.callback_query(lambda c: c.data.startswith("check_payment_"))
+async def check_payment(callback: types.CallbackQuery):
+    deal_id = int(callback.data.split("_")[2])
+    
+    try:
+        cursor.execute("SELECT crypto_invoice_id FROM deals WHERE deal_id = ?", (deal_id,))
+        result = cursor.fetchone()
+        
+        if not result or not result[0]:
+            await callback.answer("❌ Счёт не найден", show_alert=True)
+            return
+        
+        invoice_id = result[0]
+        invoices = await cp.get_invoices(invoice_ids=[invoice_id])
+        
+        if invoices and invoices[0].status == "paid":
+            cursor.execute("UPDATE deals SET status = 'paid' WHERE deal_id = ?", (deal_id,))
+            conn.commit()
+            
+            await callback.message.edit_text("✅ Оплата подтверждена! Ожидайте перевода от гаранта.")
+            
+            cursor.execute("SELECT seller_id FROM deals WHERE deal_id = ?", (deal_id,))
+            seller_id = cursor.fetchone()[0]
+            
+            await bot.send_message(
+                seller_id,
+                f"💰 Покупатель оплатил сделку #{deal_id} через Crypto Bot!"
+            )
+        elif invoices and invoices[0].status == "active":
+            await callback.answer("⏳ Ожидание оплаты", show_alert=True)
+        else:
+            await callback.answer("❌ Счёт не найден", show_alert=True)
+            
+    except Exception as e:
+        await callback.answer(f"❌ Ошибка: {str(e)}", show_alert=True)
+
 # ========== ОТКЛОНЕНИЕ СДЕЛКИ ==========
 @dp.callback_query(lambda c: c.data.startswith("reject_"))
 async def reject_deal(callback: types.CallbackQuery):
@@ -407,7 +478,7 @@ async def cancel_deal(callback: types.CallbackQuery):
     conn.commit()
     await callback.message.edit_text("❌ Сделка отменена.")
 
-# ========== ПОДТВЕРЖДЕНИЕ ОПЛАТЫ ==========
+# ========== ПОДТВЕРЖДЕНИЕ РУЧНОЙ ОПЛАТЫ ==========
 @dp.callback_query(lambda c: c.data.startswith("paid_"))
 async def paid_deal(callback: types.CallbackQuery):
     deal_id = int(callback.data.split("_")[1])
@@ -420,12 +491,9 @@ async def paid_deal(callback: types.CallbackQuery):
     
     await callback.message.edit_text("✅ Оплата подтверждена. Ожидайте перевода от гаранта.")
     
-    # Уведомление продавцу
     await bot.send_message(
         deal[0],
-        f"💰 Покупатель оплатил сделку #{deal_id}!\n"
-        f"Сумма: {deal[1]:,.0f} ₽\n"
-        f"Ожидайте перевода от гаранта."
+        f"💰 Покупатель оплатил сделку #{deal_id}!\nСумма: {deal[1]:,.0f} ₽"
     )
 
 # ========== ЗАПУСК ==========
